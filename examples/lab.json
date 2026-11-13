@@ -13,7 +13,7 @@
   "injection": {
     "prefix": "-1 ",
     "suffix": "-- -",
-    "union_template": "{prefix}UNION SELECT {cols}{suffix}",
+    "union_template": "{prefix}UNION ALL SELECT {cols}{suffix}",
     "keyword_obfuscation": null,
     "ncols": 5,
     "max_ncols": 5
