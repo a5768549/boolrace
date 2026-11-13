@@ -92,7 +92,9 @@ class Handler(BaseHTTPRequestHandler):
                     row = cursor.fetchone()
             self.respond(200, render_row(row or ["", "", "", "", ""]), "text/html; charset=utf-8")
         except Exception as exc:
-            # Lab errors stay visible, but do not echo untrusted SQL or DB settings.
+            # Numeric DB error codes aid fixture diagnostics without logging SQL.
+            code = exc.args[0] if exc.args and type(exc.args[0]) is int else "unknown"
+            print("fixture query error: %s code=%s" % (type(exc).__name__, code), flush=True)
             self.respond(500, "SQL query error: " + type(exc).__name__)
 
     def log_message(self, format, *args):
