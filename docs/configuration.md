@@ -10,7 +10,7 @@ Start from [`examples/lab.json`](../examples/lab.json), not a target-specific re
 | `target.schema` | `boolrace_lab`, the fixture's database. For extraction/verification, a configured schema must exactly equal the connection's `DATABASE()` result; cross-schema extraction is unsupported. |
 | `target.verify_tls` | `true`. The lab uses plain HTTP on loopback; do not disable certificate validation for remote HTTPS endpoints. |
 | `injection.prefix` / `suffix` | `-1 ` and `-- -`, matched to the deliberately vulnerable numeric fixture query. |
-| `injection.union_template` | Five-column reflected `UNION` shape discovered/checked by probing. |
+| `injection.union_template` | Five-column reflected `UNION ALL` shape, matching the fixture's binary projections; see database constraints in [limitations](limitations.md). |
 | `slots.definitions` / `probe_order` | One title plus four paragraph slots; definitions and ordering are explicit. |
 | `extraction.mode` | `compress` in the example; the smoke runner also accepts `union`. |
 | `extraction.framing` | `length`, recommended to preserve separators embedded inside values. |

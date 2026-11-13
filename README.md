@@ -1,5 +1,7 @@
 # boolrace
 
+[![CI](https://github.com/a5768549/boolrace/actions/workflows/ci.yml/badge.svg)](https://github.com/a5768549/boolrace/actions/workflows/ci.yml)
+
 **v0.1.0 — experimental.** A small Python research engine for studying the integrity of MySQL/MariaDB data transported through a reflected `UNION` channel. Intended for disposable local labs and explicitly authorized testing only.
 
 It is **not a sqlmap replacement**, a general vulnerability scanner, or a universally reliable database dumper. A successful HTTP response is not proof of a complete or correct extraction.
@@ -54,7 +56,7 @@ python -m unittest discover -s tests -v
 python -m unittest discover -s lab -p 'test_*.py' -v
 ```
 
-CI defines Ubuntu unit-test jobs on Python 3.10 and 3.14, plus a separate integration job using real MariaDB 11.4 and the local HTTP fixture. Offline unit tests are **not** proof that SQL works against a database; consult the actual CI result for the revision you use. No database integration pass is claimed merely because this workflow exists.
+CI runs Ubuntu unit-test jobs on Python 3.10 and 3.14, plus a separate integration job using real MariaDB 11.4 and the local HTTP fixture. The release candidate passed both unit jobs and exact-row/CRC checks for `union` and `compress`; see the [verification record](docs/verification.md) for the tested revision, logs, and earlier failed experiments. This does not establish compatibility outside the documented fixture.
 
 There is no published, validated speedup or cross-tool performance comparison. Historical timing claims are unverified. The [benchmark protocol](docs/benchmark.md) defines evidence to collect before making a performance claim.
 

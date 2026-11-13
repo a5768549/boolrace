@@ -18,6 +18,12 @@ Native `report` is unsupported in v0.1.0 and exits with status 2, even with `--d
 
 Extraction and verification require a selected schema to exactly equal the connection's `DATABASE()` result; cross-schema extraction is unsupported. Table names are restricted to ASCII `[A-Za-z0-9_][A-Za-z0-9_-]*`, and column names to ASCII `[A-Za-z0-9_]+`. Reserved table filenames and case-insensitive duplicate tables/columns are rejected. See the [configuration guide](configuration.md) for the complete reserved-name list.
 
+## Fixture-specific database constraints
+
+The shipped fixture uses `UNION ALL` and binary output projections. During release testing, the original `UNION` (distinct) fixture triggered MariaDB 11.4.13 temporary-table error 126 followed by a server signal 11; switching that fixture to `UNION ALL` avoided that observed crash. The text-projection variant also produced collation error 1271 when combined with JSON expressions. These are controlled-lab configuration constraints, not general compatibility fixes in the engine. Never run capacity probes against a database whose availability matters.
+
+Metadata enumeration fails on query errors and on exhaustion of its existing schema/table/column budgets (30/200/100) without an end sentinel. Exactly reaching a budget is also rejected. Empty/`NULL` remains the end convention; ambiguous target rendering cannot establish completeness.
+
 ## Remaining constraints
 
 - **No global snapshot guarantee.** Probing, counting, sizing, extraction, and verification use separate queries. Freeze the synthetic data; for authorized datasets, plan consistency externally. Do not infer transaction isolation from a checksum.
