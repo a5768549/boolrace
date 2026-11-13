@@ -132,6 +132,85 @@ class CLITests(unittest.TestCase):
         self.assertEqual(len(first_table_queries), 1, "duplicate enumeration")
 
 
+    def test_metadata_errors_do_not_publish_partial_success(self):
+        for metadata in ("schemata", "tables", "columns"):
+            stages = ("fingerprint", "enumerate", "all") if metadata == "schemata" else ("enumerate", "all")
+            for stage in stages:
+                for error in (boolrace.QueryError, boolrace.ChannelError, boolrace.SilentFailure):
+                    with self.subTest(metadata=metadata, stage=stage, error=error.__name__):
+                        target = OfflineTarget()
+                        out = self.base / (metadata + stage + error.__name__)
+                        def query(expr, *args, **kwargs):
+                            if ("FROM information_schema." + metadata) in expr and "LIMIT 1,1" in expr:
+                                raise error("offline metadata failure")
+                            return target.query(expr, *args, **kwargs)
+                        with mock.patch.object(boolrace.Transport, "get", side_effect=target.get), mock.patch.object(boolrace.Engine, "query", side_effect=query), mock.patch.object(boolrace.time, "sleep"):
+                            code, output = self.invoke(stage, "--out", str(out))
+                        self.assertEqual(code, 1, output)
+                        self.assertIn("offline metadata failure", output)
+                        self.assertNotIn("[extract]", output)
+                        self.assertNotIn("[verify]", output)
+                        for artifact in ("_schema.json", "_verify.json", "items.json"):
+                            self.assertFalse((out / artifact).exists(), artifact)
+                        if metadata == "schemata":
+                            self.assertFalse((out / "_fingerprint.json").exists())
+
+    def test_metadata_limits_do_not_publish_partial_success(self):
+        self.write_config({"target": {"schema": "lab"}})
+        for metadata, limit in (("schemata", 30), ("tables", 200), ("columns", 100)):
+            stages = ("fingerprint", "enumerate", "all") if metadata == "schemata" else ("enumerate", "all")
+            for stage in stages:
+                with self.subTest(metadata=metadata, stage=stage):
+                    target = OfflineTarget()
+                    offsets = []
+                    out = self.base / (metadata + stage)
+                    def query(expr, *args, **kwargs):
+                        if ("FROM information_schema." + metadata) in expr and "LIMIT" in expr:
+                            index = int(re.search(r"LIMIT (\d+),1", expr).group(1))
+                            offsets.append(index)
+                            return "entry%d" % index, 200, 0
+                        return target.query(expr, *args, **kwargs)
+                    with mock.patch.object(boolrace.Transport, "get", side_effect=target.get), mock.patch.object(boolrace.Engine, "query", side_effect=query), mock.patch.object(boolrace.time, "sleep"):
+                        code, output = self.invoke(stage, "--out", str(out))
+                    self.assertEqual(code, 1, output)
+                    self.assertIn("SilentFailure", output)
+                    self.assertIn("enumeration limit", output)
+                    self.assertIn(str(limit), output)
+                    self.assertEqual(offsets, list(range(limit)))
+                    self.assertNotIn("[extract]", output)
+                    self.assertNotIn("[verify]", output)
+                    for artifact in ("_schema.json", "_verify.json"):
+                        self.assertFalse((out / artifact).exists(), artifact)
+                    if metadata == "schemata":
+                        self.assertFalse((out / "_fingerprint.json").exists())
+
+    def test_metadata_sentinels_remain_normal_end_including_last_slot(self):
+        for metadata, limit in (("schemata", 30), ("tables", 2), ("columns", 2)):
+            for end in (0, limit - 1):
+                for sentinel in ("", "NULL", "null", None):
+                    with self.subTest(metadata=metadata, end=end, sentinel=sentinel):
+                        engine = boolrace.Engine(boolrace.load_cfg(str(self.cfg)))
+                        target = OfflineTarget()
+                        offsets = []
+                        def query(expr, *args, **kwargs):
+                            if ("FROM information_schema." + metadata) in expr and "LIMIT" in expr:
+                                index = int(re.search(r"LIMIT (\d+),1", expr).group(1))
+                                offsets.append(index)
+                                return (sentinel if index == end else "entry%d" % index), 200, 0
+                            return target.query(expr, *args, **kwargs)
+                        try:
+                            with mock.patch.object(boolrace.Transport, "get", side_effect=AssertionError("network")), mock.patch.object(boolrace.Engine, "query", side_effect=query), mock.patch.object(boolrace.time, "sleep"):
+                                if metadata == "schemata":
+                                    result = engine.fingerprint()["databases"]
+                                elif metadata == "tables":
+                                    result = engine.list_tables("lab", limit=limit)
+                                else:
+                                    result = engine.list_columns("lab", "items", limit=limit)
+                            self.assertEqual(result, ["entry%d" % i for i in range(end)])
+                            self.assertEqual(offsets, list(range(end + 1)))
+                        finally:
+                            engine.close()
+
     def test_multi_schema_and_wrong_current_schema_fail_closed(self):
         for schemas, configured, current in ((["lab", "other"], None, "lab"), (["other"], None, "lab"), (["lab", "other"], "other", "lab")):
             with self.subTest(schemas=schemas, configured=configured):

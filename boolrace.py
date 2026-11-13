@@ -12,6 +12,10 @@ construct an engine, discover SQL, contact a target, or write output files.
 Column mode and generated Markdown/JSON reports are unsupported. Stage JSON
 artifacts remain available. CRC32 sums are non-cryptographic checks, not proof
 of integrity or row order. Use static fixtures for experimental evaluation.
+Metadata enumeration retains the empty/NULL end sentinel convention; a target
+that renders missing values ambiguously cannot establish completeness. Query
+errors and exhausted schema/table/column limits (30/200/100) fail closed; even
+exactly that many entries require an end sentinel within the existing budget.
 
 Example: python boolrace.py all --config cfg.lab.json --dry-run
 """
@@ -874,15 +878,14 @@ class Engine:
         # 資料庫清單（逐號列，避免 GROUP_CONCAT 的 1024 上限）
         dbs = []
         for i in range(30):
-            try:
-                v, _, _ = self.query(
-                    "(SELECT schema_name FROM information_schema.schemata LIMIT %d,1)" % i)
-            except Exception:
-                break
+            v, _, _ = self.query(
+                "(SELECT schema_name FROM information_schema.schemata LIMIT %d,1)" % i)
             if not v or v.upper() == "NULL":
                 break
             dbs.append(v)
             time.sleep(0.05)
+        else:
+            raise SilentFailure("schema enumeration limit 30 reached without an end sentinel")
         out["databases"] = dbs
         self.profile.update(out)
         return out
@@ -894,14 +897,15 @@ class Engine:
             ex = ("(SELECT table_name FROM information_schema.tables "
                   "WHERE table_schema=0x%s LIMIT %d,1)"
                   % (schema.encode().hex(), i))
-            try:
-                v, _, _ = self.query(ex)
-            except QueryError:
-                break
+            v, _, _ = self.query(ex)
             if not v or v.upper() == "NULL":
                 break
             names.append(v)
             time.sleep(0.05)
+        else:
+            raise SilentFailure(
+                "table enumeration limit %d reached for schema %r without an end sentinel"
+                % (limit, schema))
         return names
 
     def list_columns(self, schema, table, limit=100):
@@ -910,14 +914,15 @@ class Engine:
             ex = ("(SELECT column_name FROM information_schema.columns "
                   "WHERE table_schema=0x%s AND table_name=0x%s LIMIT %d,1)"
                   % (schema.encode().hex(), table.encode().hex(), i))
-            try:
-                v, _, _ = self.query(ex)
-            except QueryError:
-                break
+            v, _, _ = self.query(ex)
             if not v or v.upper() == "NULL":
                 break
             cols.append(v)
             time.sleep(0.05)
+        else:
+            raise SilentFailure(
+                "column enumeration limit %d reached for %r.%r without an end sentinel"
+                % (limit, schema, table))
         return cols
 
     # ---------------------------------------------------------- extract
