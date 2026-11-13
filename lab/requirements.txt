@@ -1,0 +1,2 @@
+# Optional local-lab dependency; the engine needs only Python stdlib.
+PyMySQL==1.1.2

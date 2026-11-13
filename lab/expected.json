@@ -1,0 +1,47 @@
+{
+  "table": "specimens",
+  "cols": [
+    "id",
+    "label",
+    "note",
+    "quantity"
+  ],
+  "rows": [
+    [
+      "1",
+      "synthetic-alpha",
+      null,
+      "7"
+    ],
+    [
+      "2",
+      "synthetic-empty",
+      "",
+      "0"
+    ],
+    [
+      "3",
+      "測試 café 😀",
+      "Unicode stays intact",
+      "-3"
+    ],
+    [
+      "4",
+      "synthetic-separator",
+      "left\u001fright",
+      "42"
+    ],
+    [
+      "5",
+      "synthetic-markup",
+      "<tag>& \"quotes\"",
+      null
+    ],
+    [
+      "6",
+      "synthetic-whitespace",
+      "  padded\nline  ",
+      "100"
+    ]
+  ]
+}
