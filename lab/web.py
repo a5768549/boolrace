@@ -85,9 +85,12 @@ class Handler(BaseHTTPRequestHandler):
                                      "application/json; charset=utf-8")
                         return
                     # Deliberate injection point. NEVER copy this into an application.
-                    query = ("SELECT CAST(id AS CHAR), label, COALESCE(note,''), "
-                             "CAST(quantity AS CHAR), 'synthetic' FROM specimens WHERE id="
-                             + params["id"][0])
+                    # Binary projection makes this fixture's reflection byte-oriented;
+                    # it avoids mixing application and JSON expression collations.
+                    query = ("SELECT CAST(id AS BINARY), CAST(label AS BINARY), "
+                             "CAST(COALESCE(note,'') AS BINARY), "
+                             "CAST(quantity AS BINARY), CAST('synthetic' AS BINARY) "
+                             "FROM specimens WHERE id=" + params["id"][0])
                     cursor.execute(query)
                     row = cursor.fetchone()
             self.respond(200, render_row(row or ["", "", "", "", ""]), "text/html; charset=utf-8")
